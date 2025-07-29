@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+      {
+          "Sid": "Statement1",
+          "Effect": "Allow",
+          "Action": [
+              "s3:GetObject",
+              "s3:PutObject"
+          ],
+          "Resource": "substitua_pelo_ARN_do_seu_bucket_aqui_DEIXE_O_ASTERISCO_NO_FINAL/*"
+      },
+      {
+          "Effect": "Allow",
+          "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+          ],
+          "Resource": "arn:aws:logs:*:*:*"
+      }
+  ]
+}
