@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Arquitetura assíncrona completa com API Gateway, SQS, Lambda e S3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "aws-async-sqs"
+    Description: Nome base para os recursos a serem criados.
+
+Resources:
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-results-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FibonacciDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq"
+      MessageRetentionPeriod: 1209600
+
+  FibonacciQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-queue"
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FibonacciDLQ.Arn
+        maxReceiveCount: 3
+
+  ProxyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SendToSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FibonacciQueue.Arn
+
+  ProxyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-proxy"
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+      Role: !GetAtt ProxyLambdaRole.Arn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref FibonacciQueue
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sqs = boto3.client('sqs')
+          QUEUE_URL = os.environ['QUEUE_URL']
+
+          def lambda_handler(event, context):
+              print(f"Evento recebido: {json.dumps(event)}")
+
+              try:
+                  number = event.get('queryStringParameters', {}).get('number')
+
+                  if not number:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Parâmetro "number" é obrigatório. Use: ?number=10'})
+                      }
+
+                  try:
+                      num_value = int(number)
+                      if num_value <= 0:
+                          raise ValueError("Número deve ser maior que 0")
+                  except ValueError as e:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Número inválido: {str(e)}'})
+                      }
+
+                  response = sqs.send_message(
+                      QueueUrl=QUEUE_URL,
+                      MessageBody=json.dumps({'number': num_value})
+                  )
+
+                  print(f"✅ Mensagem enviada para SQS. MessageId: {response['MessageId']}")
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'message': f'Número {num_value} enviado para processamento!',
+                          'messageId': response['MessageId'],
+                          'queueUrl': QUEUE_URL
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"❌ ERRO: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  ProxyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+      Description: API para enviar números para a fila SQS Fibonacci.
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+        AllowHeaders:
+          - "*"
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyLambda.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /fibo"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSqsS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt FibonacciQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${ResultsBucket.Arn}/*"
+
+  FibonacciLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-lambda"
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          RESULTS_BUCKET_NAME: !Ref ResultsBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+
+          s3 = boto3.client('s3')
+          BUCKET_NAME = os.environ['RESULTS_BUCKET_NAME']
+
+          def fibonacci(n):
+              """Calcula Fibonacci de forma recursiva"""
+              if n <= 1:
+                  return n
+              else:
+                  return fibonacci(n-1) + fibonacci(n-2)
+
+          def lambda_handler(event, context):
+              print(f"Evento recebido: {json.dumps(event)}")
+
+              for record in event['Records']:
+                  message_id = record['messageId']
+
+                  try:
+                      body = json.loads(record['body'])
+                      print(f"Body parseado: {body}")
+
+                      number_to_process = int(body.get('number', 0))
+
+                      if number_to_process <= 0:
+                          print(f"Número inválido: {number_to_process}. Deve ser maior que 0.")
+                          continue
+
+                      if number_to_process > 35:
+                          print(f"⚠️  AVISO: Número {number_to_process} muito alto. Recursão pode ser lenta!")
+
+                      print(f"Calculando Fibonacci para o número: {number_to_process}")
+                      result = fibonacci(number_to_process)
+                      print(f"Resultado do Fibonacci: {result}")
+
+                      result_data = {
+                          'input_number': number_to_process,
+                          'fibonacci_result': result,
+                          'message_id': message_id,
+                          'timestamp': datetime.utcnow().isoformat()
+                      }
+
+                      file_name = f"result_{number_to_process}_{uuid.uuid4().hex[:8]}.json"
+                      s3.put_object(
+                          Bucket=BUCKET_NAME,
+                          Key=file_name,
+                          Body=json.dumps(result_data, indent=2),
+                          ContentType='application/json'
+                      )
+                      print(f"✅ Resultado salvo com sucesso no S3: s3://{BUCKET_NAME}/{file_name}")
+
+                  except ValueError as ve:
+                      print(f"❌ ERRO de valor ao processar mensagem {message_id}: {str(ve)}")
+
+                  except Exception as e:
+                      print(f"❌ ERRO ao processar a mensagem {message_id}: {str(e)}")
+                      raise e
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Processamento concluído com sucesso.')
+              }
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FibonacciQueue.Arn
+      FunctionName: !GetAtt FibonacciLambda.Arn
+      Enabled: true
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  ApiEndpoint:
+    Description: "Endpoint da API - Cole no navegador!"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/fibo?number=10"
+    Export:
+      Name: !Sub "${ProjectName}-api-endpoint"
+
+  ApiBaseUrl:
+    Description: "URL base da API"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${ProjectName}-api-base-url"
+
+  ResultsBucketName:
+    Description: "Nome do bucket S3 onde os resultados são salvos"
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${ProjectName}-bucket-name"
+
+  SqsQueueUrl:
+    Description: "URL da fila SQS principal"
+    Value: !Ref FibonacciQueue
+    Export:
+      Name: !Sub "${ProjectName}-queue-url"
+
+  SqsDlqUrl:
+    Description: "URL da Dead-Letter Queue"
+    Value: !Ref FibonacciDLQ
+    Export:
+      Name: !Sub "${ProjectName}-dlq-url"
+
+  ProxyLambdaName:
+    Description: "Nome da Lambda Proxy (API Gateway → SQS)"
+    Value: !Ref ProxyLambda
+
+  ProcessorLambdaName:
+    Description: "Nome da Lambda Processadora (SQS → Fibonacci → S3)"
+    Value: !Ref FibonacciLambda
